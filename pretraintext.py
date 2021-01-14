@@ -1,4 +1,4 @@
-    #!/usr/bin/env python
+#!/usr/bin/env python
 # coding: utf-8
 
 # In[1]:
@@ -22,29 +22,8 @@ from transformers import T5Tokenizer, T5ForConditionalGeneration, T5EncoderModel
 from transformers import AdamW
 
 
-from Datasets import WikiTable, SquadDataset, Modes
+from Datasets import WikiTable, WikiTableText, SquadDataset, Modes
 from metrics import compute_exact, compute_f1
-
-
-# In[2]:
-
-
-class ConvBlock(nn.Module):
-    """
-        Convolutional block from Diedre's code:
-        https://github.com/dscarmo/IA376J_final_project/blob/439d3a5639ebc81fe5b6264074a8c4bab25904ba/cnnt5.py#L16
-    """
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.block = nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-                                   nn.BatchNorm2d(out_channels),
-                                   nn.LeakyReLU(),
-                                   nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1),
-                                   nn.BatchNorm2d(out_channels),
-                                   nn.LeakyReLU())
-
-    def forward(self, x):
-        return self.block(x)
 
 
 # In[9]:
@@ -72,33 +51,19 @@ class CNNTransformer(pl.LightningModule):
         else:
             self.sentence_encoder = T5EncoderModel.from_pretrained(self.hparams.t5_model)
         
-        # Feature adapter for combining image features and transformer 
-        # last hidden state from transformer encoder (question)
-        # hidden_dim needs to be manually setted
-        if not self.hparams.concat_only:
-            self.adapter = nn.Linear(self.hparams.hidden_dim, self.hparams.seq_len)
-        
-        #to align the channel number with transformer's decoder
-        self.CNNEmbedder = nn.Sequential(ConvBlock(3, 16),
-                                     ConvBlock(16, 64),
-                                     ConvBlock(64, 256),
-                                     ConvBlock(256, self.decoder.config.d_model))
-        
-        self.img_shape = (hparams.img_h, hparams.img_w)
         self.sync_dist = self.hparams.gpus > 1
     
     def forward(self, batch):
-        table_imgs = batch['table_img']
-        questions_ids = batch['question_ids']
+        input_ids = batch['input_ids']
+        input_attn_mask = batch['input_attn_mask']
         questions = batch['question']
-        questions_attn_mask = batch['question_attn_mask']
         answers = batch['answer']
         target_ids = batch['target_ids']
         
         
         #obtain the sentence encoder outputs
-        encoder_outputs = self.sentence_encoder(input_ids=questions_ids,
-                                                attention_mask=questions_attn_mask,
+        encoder_outputs = self.sentence_encoder(input_ids=input_ids,
+                                                attention_mask=input_attn_mask,
                                                 output_attentions=self.hparams.use_enc_attn)
         
         #batch size x seqlen x self.d_model
@@ -107,55 +72,14 @@ class CNNTransformer(pl.LightningModule):
         #perhaps use attention coming from the sentence encoder
         encoder_attn = encoder_outputs.attentions if self.hparams.use_enc_attn else None 
     
-        if self.hparams.debug:
-            print(f"batch img shape: {table_imgs.shape}")
-        
-        #get image embeddings from CNN
-        #img_features.shape (B, d_model, H, W)
-        img_features = self.CNNEmbedder(table_imgs)
-        
-        if self.hparams.debug:
-            print(f"after cnn.shape: {img_features.shape}")
-        
-        #(B, C, H, W)
-        B = img_features.size(0)
-        
-        #torch.Size([B, H, W, C]) -> torch.Size([B, H*W, C])
-        img_features = img_features.permute(0, 2, 3, 1).view(B, -1, self.decoder.config.d_model)
-        img_features = img_features.contiguous()
-        
-        #torch.Size([B, H*W + seqlen, d_model])
-        combined_feat = torch.cat([img_features, encoder_hidden_state], dim=1)
-        
-        proj_features = None
-        if self.hparams.concat_only:
-            proj_features = combined_feat
-        else:
-            #torch.Size([B, d_model, H*W + seqlen])
-            combined_feat = combined_feat.permute(0, 2, 1)
-
-            if self.hparams.debug:
-                print(f"Combined feat.shape: {combined_feat.shape}")
-
-            #torch.Size([B, d_model, hidden_dim=hidden_state_dim])
-            proj_features = self.adapter(combined_feat)
-
-            #torch.Size([B, hidden_state_dim, d_model]) -- ready to be used as last hidden state!    
-            proj_features = proj_features.permute(0, 2, 1)
-        
-        assert proj_features is not None, "Projected features are None"
-        
-        if self.hparams.debug:
-            print(f"proj feat.shape: {proj_features.shape}")
-        
         if self.training:
-            loss = self.decoder(encoder_outputs=(proj_features, encoder_attn),
+            loss = self.decoder(encoder_outputs=(encoder_hidden_state, encoder_attn),
                                 labels=target_ids).loss
             
             return loss
         else:
             
-            return self.generate_predictions(hiddn_states=proj_features,
+            return self.generate_predictions(hiddn_states=encoder_hidden_state,
                                              encoder_attentions=encoder_attn)
         
     def training_step(self, batch, batch_idx):
@@ -172,7 +96,7 @@ class CNNTransformer(pl.LightningModule):
         Usa features construídas externamente para gerar frases com T5.
         '''
         #max len for generated sequence
-        max_seq_len = self.hparams.seq_len
+        max_seq_len = self.hparams.max_decod_len
         
         #decoded ids. Initial tokens for decoding for each batch
         decoded_ids = torch.full((hiddn_states.size(0), 1),
@@ -254,66 +178,36 @@ class CNNTransformer(pl.LightningModule):
          
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
-    
-    
+
     def train_dataloader(self):
         ds = None
         if self.hparams.pretrain:
             print(f"Pretrainig using {self.hparams.squad} - Train")
             ds = SquadDataset(Modes.TRAIN, self.tokenizer, self.hparams.squad, max_len=self.hparams.seq_len)
-            return DataLoader(ds, batch_size=self.hparams.batch_size, shuffle=True, 
-                          num_workers=self.hparams.nworkers, collate_fn=self.collate)
         else:
-            print(f"Training using Wikitable")
-            ds = WikiTable(Modes.TRAIN, self.tokenizer, self.img_shape, max_len=self.hparams.seq_len)
-            return DataLoader(ds, batch_size=self.hparams.batch_size, shuffle=True, 
-                              num_workers=self.hparams.nworkers)
+            ds = WikiTableText(Modes.TRAIN, self.tokenizer, max_len=self.hparams.seq_len)
+            print(f"Training using {ds.__class__.__name__}")
+        return DataLoader(ds, batch_size=self.hparams.batch_size, shuffle=True, num_workers=self.hparams.nworkers)
 
     def val_dataloader(self):
         ds = None
         if self.hparams.pretrain:
             ds = SquadDataset(Modes.VAL, self.tokenizer, self.hparams.squad, max_len=self.hparams.seq_len)
             print(f"Pretrainig using {self.hparams.squad} - Valid")
-            return DataLoader(ds, batch_size=self.hparams.batch_size, shuffle=True, 
-                              num_workers=self.hparams.nworkers, collate_fn=self.collate)
         else:
-            print(f"Validating with Wikitable ")
-            ds = WikiTable(Modes.VAL, self.tokenizer, self.img_shape, max_len=self.hparams.seq_len)
-            return DataLoader(ds, batch_size=self.hparams.batch_size, shuffle=False, 
-                          num_workers=self.hparams.nworkers)
+            ds = WikiTableText(Modes.VAL, self.tokenizer, max_len=self.hparams.seq_len)
+            print(f"Validating with {ds.__class__.__name__}")
+        return DataLoader(ds, batch_size=self.hparams.batch_size, shuffle=False, num_workers=self.hparams.nworkers)
 
     def test_dataloader(self):
         ds = None
         if self.hparams.pretrain:
             print(f"Pretrainig using {self.hparams.squad} - Test")
             ds = SquadDataset(Modes.TEST, self.tokenizer, self.hparams.squad, max_len=self.hparams.seq_len)
-            return DataLoader(ds, batch_size=self.hparams.batch_size, shuffle=True, 
-                              num_workers=self.hparams.nworkers, collate_fn=self.collate)
         else:
-            print(f"Testing with Wikitable")
-            ds = WikiTable(Modes.TEST, self.tokenizer, self.img_shape, max_len=self.hparams.seq_len)
-            return DataLoader(ds, batch_size=self.hparams.batch_size, shuffle=False, 
-                          num_workers=self.hparams.nworkers)
-    
-    def collate(self, batch):
-        imgs = [b['table_img'].numpy() for b in batch]
-        questions = [b['question'] for b in batch]
-        answers = [b['answer'] for b in batch]
-
-        input_tokens = self.tokenizer.batch_encode_plus(questions, return_tensors="pt", padding="longest")
-        target_ids = self.tokenizer.batch_encode_plus(answers, return_tensors="pt", padding="longest")
-
-        target_ids["input_ids"][target_ids["input_ids"] == 0] = -100  
-
-        return {
-                "table_img": torch.tensor(imgs, dtype=torch.float),
-                "question_ids": input_tokens["input_ids"],
-                "question_attn_mask": input_tokens["attention_mask"],
-                "target_ids": target_ids["input_ids"],
-                "question": questions,
-                "answer": answers,
-
-        }
+            ds = WikiTableText(Modes.TEST, self.tokenizer, max_len=self.hparams.seq_len)
+            print(f"Testing with {ds.__class__.__name__}")
+        return DataLoader(ds, batch_size=self.hparams.batch_size, shuffle=False, num_workers=self.hparams.nworkers)
 
 
 # In[10]:
@@ -323,8 +217,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrain", action='store_true', help="Pretrain or Train")
     parser.add_argument("--t5_model", type=str, default="t5-base", help="T5 weights to load.")
-    parser.add_argument("--squad", type=str, default="squad_v2", help="Pretrain using squad or squad_v2")
     parser.add_argument("--seq_len", type=int, default=128, help="Transformer sequence length.")
+    parser.add_argument("--max_decod_len", type=int, default=32, help="Fast dev run mode.")
     parser.add_argument("--lr", type=float, default=5e-4, help="ADAM Learning Rate.")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size.")
     parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs.")
@@ -335,11 +229,7 @@ if __name__ == "__main__":
     parser.add_argument("--nworkers", type=int, default=mp.cpu_count(), help="Number of workers to use in dataloading.")
     parser.add_argument("--experiment_name", type=str, default="baseline", help="Single word describing experiment.")
     parser.add_argument("--description", type=str, default="No description.", help="Single phrase describing experiment.")
-    parser.add_argument("--hidden_dim", type=int, default=1152, help="Input dim for Linear projections. Needs to be adjusted manually according to image shape")
-    parser.add_argument("--img_w", type=int, default=500, help="Image shape for resizing in dataset creation")
-    parser.add_argument("--img_h", type=int, default=500, help="Image shape for resizing in dataset creation")
     parser.add_argument("--use-enc-attn", action="store_true", help="Use Encoder Attention during decoding")
-    parser.add_argument("--concat_only", action='store_true', help="Concat only or Concat + MLP as stated in the paper")
     parser.add_argument("--same-enc", action="store_true", help="Use separe encoder and decoder or not")
     parser.add_argument("--debug", action="store_true", help="Fast dev run mode.")
     parser.add_argument("--load", type=str, default=None, help="Pre trained model to start with.")
@@ -366,20 +256,15 @@ if __name__ == "__main__":
                                tags=[hparams.description],
                                params=vars(hparams))
         
-#         dir_path = os.path.join("models", hparams.experiment_name) #experiment concat+mlp
-        dir_path = os.path.join("models-ft", hparams.experiment_name) #experiment concat
-        filename = "{epoch}-{val_exact_match:.2f}-{f1_val:.2f}-same"
+        dir_path = os.path.join("models", hparams.experiment_name)
+        filename = "{epoch}-{val_extact_match:.2f}-{f1_val:.2f}-same"
         callbacks = [ModelCheckpoint(prefix=hparams.experiment_name,
                                      dirpath=dir_path,
                                      filename=filename,
                                      monitor="f1_val",
                                      mode="max")]
-    if hparams.load:
-        print(f"Loading model from: {hparams.load}")
-        model = CNNTransformer.load_from_checkpoint(hparams.load, strict=False, hparams=hparams)
-    else:
-        print("Training Model from scratch")
-        model = CNNTransformer(hparams=hparams)
+    
+    model = CNNTransformer(hparams=hparams)
 
     trainer = pl.Trainer(max_epochs=hparams.max_epochs,
                                  gpus=0 if hparams.cpu else hparams.gpus,
